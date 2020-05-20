@@ -3,202 +3,224 @@ import {
   map,
   every,
   sumBy,
+  defer,
+  invokeMap,
   omit,
+  assign,
 } from 'lodash';
 import {
   reaction,
+  observable,
+  computed,
+  toJS,
+  action,
   when
 } from 'mobx';
-import {
-  types,
-  applySnapshot,
-  getSnapshot,
-  flow,
-} from 'mobx-state-tree';
 import { observer } from 'mobx-react';
 import jsmediatags from 'jsmediatags';
 import * as localForage from 'localforage';
 import './App.css';
 
-const { model, optional, frozen, array, string, number } = types;
+class Chapter {
+  @observable duration = null;
+  @observable.shallow tags = null;
+  @observable file = null;
 
-const Chapter = model({
-  duration: optional(number, 0),
-  tags: frozen(),
-  ready: false,
-})
-.volatile(() => ({
-  file: {},
-}))
-.actions(self => ({
-  setFile(file) {
-    self.file = file;
-    self.initialize();
-  },
-  setReady(ready) {
-    self.ready = ready;
-  },
-  setTags(tags) {
-    self.tags = tags;
-  },
-  setDuration(duration) {
-    self.duration = duration;
-  },
-  initialize() {
-    when(
-      () => self.tags && self.duration,
-      () => self.setReady(true)
-    );
-
-    new jsmediatags.Reader(self.file)
-    .read({
-      onSuccess: ({ tags }) => {
-        self.setTags(tags);
-      }
-    });
-
-    console.time(self.file.name);
-    const au = document.createElement('audio');
-    au.src = self.url;
-    au.addEventListener('loadedmetadata', () => {
-      console.timeEnd(self.file.name);
-      self.setDuration(parseInt(au.duration));
-    }, false);
+  constructor(chapter) {
+    assign(this, chapter);
   }
-}))
-.views(self => ({
-  get snapshot() { // A non-serialization snapshot
-    return {
-      ...getSnapshot(self),
-      file: self.file
-    }
-  },
+
+  @computed
   get title() {
-    return self.tags.title;
-  },
+    return this.tags.title;
+  }
+
+  @computed
   get url() {
-    return URL.createObjectURL(self.file);
-  },
-}));
+    return URL.createObjectURL(this.file);
+  }
 
-const Book = model({
-  title: optional(string, ''),
-  currentChapterIndex: optional(number, 0),
-  currentChapterTime: optional(number, 0),
-  chapters: array(Chapter),
-})
-.actions(self => ({
-  initChapters(chapters) {
-    self.chapters = map(chapters, chapter => {
-      const c = Chapter.create({});
-      c.setFile(chapter);
-      return c;
-    });
-    console.log(`self.chapters`, self.chapters);
-  },
-  setCurrentChapterIndex(currentChapterIndex) {
-    self.currentChapterIndex = currentChapterIndex;
-  },
-  setCurrentChapterTime(currentChapterTime) {
-    self.currentChapterTime = currentChapterTime;
-  },
-}))
-.views(self => ({
-  get snapshot() {
-    return {
-      ...getSnapshot(self),
-      chapters: map(self.chapters, 'snapshot') // Override the chapters with custom snapshot we made
-    }
-  },
+  @computed
   get ready() {
-    return every(self.chapters, 'ready');
-  },
-  get totalDuration() {
-    return sumBy(self.chapters, 'duration');
-  },
-  get currentChapter() {
-    return self.chapters[self.currentChapterIndex];
-  },
-}))
+    return  !!(this.file && this.tags && this.duration);
+  }
 
-const Controller = model('AppController', {
-  playbackRate: 1,
-  currentBookIndex: optional(number, -1),
-  books: array(Book),
-})
-.volatile(() => ({
-  audioElement: null,
-}))
-.actions(self => ({
-  afterCreate() {
-    self.init();
-  },
-  init: flow(function* init() {
-    // Restore books and chapters
-    const state = yield localForage.getItem('state') || {};
-    if (state) {
-    applySnapshot(self, omit(state, 'books'));
-    self.books = map(state.books, restoreBook => {
-      const book = Book.create(restoreBook);
-      book.initChapters(map(restoreBook.chapters, 'file'));
-      return book;
-    });
+  @action.bound
+  setChapterFile(file) {
+    if (!this.file || this.file !== file) {
+      defer(this.init);
     }
+    this.file = file;
+  }
+
+  @action.bound
+  setTags(tags) {
+    this.tags = tags;
+  }
+
+  @action.bound
+  setDuration(duration) {
+    this.duration = duration;
+  }
+
+  init() {
+    if (!this.ready) {
+      new jsmediatags.Reader(this.file)
+      .read({
+        onSuccess: ({ tags }) => {
+          this.setTags(tags);
+        }
+      });
+
+      const au = document.createElement('audio');
+      au.src = this.url;
+      au.addEventListener('loadedmetadata', () => {
+        this.setDuration(parseInt(au.duration));
+      }, false);
+    }
+  }
+};
+
+class Book {
+  @observable title = null;
+  @observable currentChapterIndex = 0;
+  @observable currentChapterTime = 0;
+  @observable chapters = [];
+
+  constructor(book) {
+    console.time(book.title);
+    assign(this, omit(book, 'chapters'));
+    this.chapters = map(book.chapters, chapter => new Chapter(chapter));
+    invokeMap(this.chapters, 'init');
+  }
+
+  @computed
+  get ready() {
+    const ready = every(map(this.chapters, 'ready'));
+    if (ready) {
+      console.timeEnd(this.title);
+    }
+    return ready;
+  }
+
+  @computed
+  get totalDuration() {
+    return sumBy(this.chapters, 'duration');
+  }
+
+  @computed
+  get currentChapter() {
+    return this.chapters[this.currentChapterIndex];
+  }
+
+  @action.bound
+  setCurrentChapterIndex(currentChapterIndex) {
+    this.currentChapterIndex = currentChapterIndex;
+  }
+
+  @action.bound
+  setCurrentChapterTime(currentChapterTime) {
+    this.currentChapterTime = currentChapterTime;
+  }
+}
+
+
+class Controller {
+  @observable playbackRate = 1;
+  @observable currentBookIndex = -1;
+  @observable books = [];
+  @observable loading = false;
+
+  audioElement = null;
+
+  constructor() {
+    console.log(`WHY WHY WHY`);
+    this.init(); 
+  }
+
+  @computed
+  get currentBook() {
+    return this.books[this.currentBookIndex];
+  }
+
+  @computed
+  get snapshot() {
+    return omit({
+      ...toJS(this),
+      books: toJS(this.books)
+    }, 'audioElement');
+  }
+
+  @action.bound
+  async init() {
+    this.loading = true;
+    const state = await localForage.getItem('state');
+    console.time('huh')
+    if (state) {
+      assign(this, omit(state, 'books'));
+      this.books = map(state.books, book => new Book(book));
+    }
+    console.timeEnd('huh');
 
     reaction(
-      () => [self.snapshot],
-      snapshot => localForage.setItem('state', ...snapshot),
+      () => [this.snapshot],
+      snapshot => {
+        console.log(`snapshot`, snapshot);
+        localForage.setItem('state', ...snapshot)
+      },
       { delay: 500 }
     );
-  }),
+
+    this.loading = false;
+  }
+
+  @action.bound
   setCurrentBookIndex(currentBookIndex) {
-    self.currentBookIndex = currentBookIndex;
-  },
+    this.currentBookIndex = currentBookIndex;
+  }
+
+  @action.bound
   setChapters(chapters) {
-    const book = Book.create({ title: `New Book ${self.books.length + 1}`});
-    book.initChapters(chapters);
-    self.books.push(book);
-  },
+    const book = new Book({ title: `New Book ${this.books.length + 1}`, chapters: map(chapters, chapter => new Chapter({ file: chapter}))});
+    this.books.push(book);
+  }
+
+  @action.bound
   setAudioElement(audioElement) {
-    self.audioElement = audioElement;
-  },
+    this.audioElement = audioElement;
+  }
+
+  @action.bound
   async playChapter(chapter, i) {
-    self.currentBook.setCurrentChapterIndex(i);
+    this.currentBook.setCurrentChapterIndex(i);
     when(
       () => chapter.ready,
       () => {
-        self.audioElement.src = chapter.url;
-        self.audioElement.play();
-        self.setPlaybackRate(self.playbackRate);
+        this.audioElement.src = chapter.url;
+        this.audioElement.play();
+        this.setPlaybackRate(this.playbackRate);
         window.document.title = chapter.title;
       }
     );
-  },
-  setPlaybackRate(playbackRate) {
-    self.playbackRate = playbackRate;
-    self.audioElement.playbackRate = playbackRate;
-  },
-  adjustPlaybackRate(adjustment) {
-    self.setPlaybackRate(self.playbackRate + adjustment)
   }
-}))
-.views(self => ({
-  get snapshot() {
-    return {
-      ...getSnapshot(self),
-      books: map(self.books, 'snapshot'),
-    }
-  },
-  get currentBook() {
-    console.log(`self.currentBookIndex`, self.currentBookIndex);
-    return self.books[self.currentBookIndex];
-  }
-}))
 
+  @action.bound
+  setPlaybackRate(playbackRate) {
+    this.playbackRate = playbackRate;
+    this.audioElement.playbackRate = playbackRate;
+  }
+
+  @action.bound
+  adjustPlaybackRate(adjustment) {
+    this.setPlaybackRate(this.playbackRate + adjustment)
+  }
+}
+
+@observer
 class App extends React.PureComponent {
   constructor(props) {
     super(props);
-    this.c = Controller.create({})
+    this.c = new Controller();
     this.audioElement = React.createRef();
   }
 
@@ -212,17 +234,17 @@ class App extends React.PureComponent {
           multiple
           accept="audio/mp3"
         />
-        {map(this.c.books, (book, i) => (
+
+      {map(this.c.books, (book, i) => {
+        return (
           book.ready && (
             <div onClick={() => this.c.setCurrentBookIndex(i)}>
               {book.title}
             </div>
           )
-        ))}
+        )}
+      )}
 
-
-
-        
         {this.c.currentBook && this.c.currentBook.ready && (
           map(this.c.currentBook.chapters, (chapter, i) => (
             <div key={chapter.title} onClick={() => this.c.playChapter(chapter, i)}>{this.c.currentBook.currentChapter === chapter ? '->' : '' } {chapter.title}</div>
@@ -251,4 +273,4 @@ class App extends React.PureComponent {
   }
 }
 
-export default observer(App);
+export default App;
