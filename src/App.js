@@ -2,275 +2,283 @@ import React from 'react';
 import {
   map,
   every,
+  indexOf,
   sumBy,
-  defer,
-  invokeMap,
-  omit,
-  assign,
+  endsWith,
 } from 'lodash';
 import {
-  reaction,
-  observable,
-  computed,
-  toJS,
-  action,
   when
 } from 'mobx';
-import { observer } from 'mobx-react';
-import jsmediatags from 'jsmediatags';
+import { Observer } from 'mobx-react';
+import {
+  types,
+  addDisposer,
+  onSnapshot,
+  applySnapshot,
+  flow
+} from 'mobx-state-tree';
+
+import jsmediatags from 'jsmediatags/dist/jsmediatags.min.js';
 import * as localForage from 'localforage';
 import './App.css';
 
-class Chapter {
-  @observable duration = null;
-  @observable.shallow tags = null;
-  @observable file = null;
+const {
+  array,
+  boolean,
+  model,
+  number,
+  maybeNull,
+  optional,
+  string,
+  frozen
+} = types;
 
-  constructor(chapter) {
-    assign(this, chapter);
-  }
+// Friendly aliases
+const View = model;
+const DataModel = model;
+const ViewController = model;
 
-  @computed
-  get title() {
-    return this.tags.title;
-  }
-
-  @computed
-  get url() {
-    return URL.createObjectURL(this.file);
-  }
-
-  @computed
-  get ready() {
-    return  !!(this.file && this.tags && this.duration);
-  }
-
-  @action.bound
-  setChapterFile(file) {
-    if (!this.file || this.file !== file) {
-      defer(this.init);
-    }
-    this.file = file;
-  }
-
-  @action.bound
-  setTags(tags) {
-    this.tags = tags;
-  }
-
-  @action.bound
-  setDuration(duration) {
-    this.duration = duration;
-  }
-
-  init() {
-    if (!this.ready) {
-      new jsmediatags.Reader(this.file)
-      .read({
+const Chapter = DataModel('Chapter', {
+  duration: maybeNull(number),
+  tags: maybeNull(frozen()),
+  file: maybeNull(frozen()),
+})
+.actions(self => ({
+  afterCreate() {
+    if (!self.ready) {
+      jsmediatags.read(self.file, {
         onSuccess: ({ tags }) => {
-          this.setTags(tags);
+          self.setTags(tags);
+        },
+        onError: (e) => {
+          console.error(e);
         }
       });
 
       const au = document.createElement('audio');
-      au.src = this.url;
+      au.src = self.url;
       au.addEventListener('loadedmetadata', () => {
-        this.setDuration(parseInt(au.duration));
+        self.setDuration(parseInt(au.duration));
       }, false);
     }
-  }
-};
-
-class Book {
-  @observable title = null;
-  @observable currentChapterIndex = 0;
-  @observable currentChapterTime = 0;
-  @observable chapters = [];
-
-  constructor(book) {
-    console.time(book.title);
-    assign(this, omit(book, 'chapters'));
-    this.chapters = map(book.chapters, chapter => new Chapter(chapter));
-    invokeMap(this.chapters, 'init');
-  }
-
-  @computed
+  },
+  setTags(tags) {
+    self.tags = tags;
+  },
+  setDuration(duration) {
+    self.duration = duration;
+  },
+}))
+.views(self => ({
+  get title() {
+    return self.tags.title || self.file.name;
+  },
+  get url() {
+    return window.URL.createObjectURL(self.file);
+  },
   get ready() {
-    const ready = every(map(this.chapters, 'ready'));
-    if (ready) {
-      console.timeEnd(this.title);
-    }
-    return ready;
-  }
+    return !!(self.file && self.tags && self.duration);
+  },
+}));
 
-  @computed
-  get totalDuration() {
-    return sumBy(this.chapters, 'duration');
-  }
 
-  @computed
-  get currentChapter() {
-    return this.chapters[this.currentChapterIndex];
-  }
+const Book = DataModel('Book', {
+  title: maybeNull(string),
+  currentChapterIndex: optional(number, 0),
+  currentChapterTime: optional(number, 0),
+  chapters: array(Chapter),
+})
+.actions(self => ({
+  afterCreate() {
 
-  @action.bound
+  },
   setCurrentChapterIndex(currentChapterIndex) {
-    this.currentChapterIndex = currentChapterIndex;
-  }
-
-  @action.bound
+    self.currentChapterIndex = currentChapterIndex;
+  },
   setCurrentChapterTime(currentChapterTime) {
-    this.currentChapterTime = currentChapterTime;
+    self.currentChapterTime = currentChapterTime;
+  },
+}))
+.views(self => ({
+  get ready() {
+    return every(self.chapters, 'ready');
+  },
+  get totalDuration() {
+    return sumBy(self.chapters, 'duration');
+  },
+  get currentChapter() {
+    return self.chapters[self.currentChapterIndex];
   }
-}
+}));
 
-
-class Controller {
-  @observable playbackRate = 1;
-  @observable currentBookIndex = -1;
-  @observable books = [];
-  @observable loading = false;
-
-  audioElement = null;
-
-  constructor() {
-    console.log(`WHY WHY WHY`);
-    this.init(); 
-  }
-
-  @computed
-  get currentBook() {
-    return this.books[this.currentBookIndex];
-  }
-
-  @computed
-  get snapshot() {
-    return omit({
-      ...toJS(this),
-      books: toJS(this.books)
-    }, 'audioElement');
-  }
-
-  @action.bound
-  async init() {
-    this.loading = true;
-    const state = await localForage.getItem('state');
-    console.time('huh')
+const Controller = ViewController('Controller', {
+  playbackRate: optional(number, 1),
+  currentBookIndex: optional(number, -1),
+  currentChapterPosition: optional(number, 0),
+  books: array(Book),
+})
+.volatile(self => ({
+  audioElement: null,
+  loading: optional(boolean, false),
+}))
+.actions(self => ({
+  afterCreate() {
+    self.restore();
+    addDisposer(self, onSnapshot(self, state => {
+      console.log(`state.currentChapterPosition`, state.currentChapterPosition);
+      localForage.setItem('state', state);
+    }));
+  },
+  restore: flow(function* restore() {
+    self.loading = true;
+    const state = yield localForage.getItem('state');
     if (state) {
-      assign(this, omit(state, 'books'));
-      this.books = map(state.books, book => new Book(book));
+      applySnapshot(self, state);
+      when(
+        () => self.currentBook.ready,
+        () => {
+          self.playChapter(self.currentBook.chapters[self.currentBook.currentChapterIndex], false);
+        }
+      );
     }
-    console.timeEnd('huh');
-
-    reaction(
-      () => [this.snapshot],
-      snapshot => {
-        console.log(`snapshot`, snapshot);
-        localForage.setItem('state', ...snapshot)
-      },
-      { delay: 500 }
-    );
-
-    this.loading = false;
-  }
-
-  @action.bound
+    self.loading = false;
+  }),
   setCurrentBookIndex(currentBookIndex) {
-    this.currentBookIndex = currentBookIndex;
-  }
-
-  @action.bound
-  setChapters(chapters) {
-    const book = new Book({ title: `New Book ${this.books.length + 1}`, chapters: map(chapters, chapter => new Chapter({ file: chapter}))});
-    this.books.push(book);
-  }
-
-  @action.bound
+    self.currentBookIndex = currentBookIndex;
+  },
+  setCurrentChapterPosition(currentChapterPosition) {
+    self.currentChapterPosition = currentChapterPosition;
+  },
+  saveBook(title, chapters) {
+    const book = new Book({ title, chapters: map(chapters, chapter => new Chapter({ file: chapter}))});
+    self.books.push(book);
+    if (self.books.length === 1) {
+      self.setCurrentBookIndex(0);
+    }
+  },
   setAudioElement(audioElement) {
-    this.audioElement = audioElement;
-  }
+    self.audioElement = audioElement;
 
-  @action.bound
-  async playChapter(chapter, i) {
-    this.currentBook.setCurrentChapterIndex(i);
+    self.audioElement.addEventListener('ended', () => {
+      self.playChapter(self.currentBook.currentChapterIndex + 1);
+    }, false);
+
+    self.audioElement.addEventListener('timeupdate', (update) => {
+      self.setCurrentChapterPosition(self.audioElement.currentTime);
+    }, false);
+
+    self.audioElement.addEventListener('canplay', () => {
+      if (self.currentChapterPosition) {
+        self.audioElement.currentTime = self.currentChapterPosition;
+      }
+    }, { once: true });
+  },
+  playChapter(chapter, start = true) {
+    self.currentBook.setCurrentChapterIndex(indexOf(self.currentBook.chapters, chapter));
     when(
-      () => chapter.ready,
+      () => self.audioElement && chapter.ready,
       () => {
-        this.audioElement.src = chapter.url;
-        this.audioElement.play();
-        this.setPlaybackRate(this.playbackRate);
+        self.audioElement.src = chapter.url;
+        self.setPlaybackRate(self.playbackRate);
         window.document.title = chapter.title;
+        if (start) {
+          self.audioElement.play();
+        }
       }
     );
-  }
-
-  @action.bound
+  },
   setPlaybackRate(playbackRate) {
-    this.playbackRate = playbackRate;
-    this.audioElement.playbackRate = playbackRate;
-  }
-
-  @action.bound
+    self.playbackRate = playbackRate;
+    self.audioElement.playbackRate = self.playbackRate;
+  },
   adjustPlaybackRate(adjustment) {
-    this.setPlaybackRate(this.playbackRate + adjustment)
+    self.setPlaybackRate(self.playbackRate + adjustment)
+    self.audioElement.playbackRate = self.playbackRate;
   }
-}
+}))
+.views(self => ({
+  get currentBook() {
+    return self.books[self.currentBookIndex];
+  },
+}));
 
-@observer
-class App extends React.PureComponent {
-  constructor(props) {
-    super(props);
-    this.c = new Controller();
-    this.audioElement = React.createRef();
+const AppView = View('App', {
+  c: optional(Controller, () => Controller.create()),
+})
+.volatile(self => ({
+  audioElementRef: React.createRef(),
+}))
+.actions(self => ({
+  afterCreate() {
+
+  },
+  async chooseDirectory() {
+    const directoryHandler = await window.showDirectoryPicker();
+    const chapters = [];
+    for await (const entry of directoryHandler.values()) {
+      if (endsWith(entry.name, 'mp3')) {
+        const fileHandle = await directoryHandler.getFileHandle(entry.name);
+        const file = await fileHandle.getFile();
+        chapters.push(file);
+      }
+    }
+    self.c.saveBook(directoryHandler.name, chapters);
   }
+}))
+.views(self => ({
+  get render() {
 
-  render() {
     return (
       <div>
-        <input
-          id="chapter-input"
-          onChange={(e) => this.c.setChapters(e.currentTarget.files)}
-          type="file"
-          multiple
-          accept="audio/mp3"
-        />
+      <button onClick={self.chooseDirectory}>Add Book</button>
 
-      {map(this.c.books, (book, i) => {
+      <Observer>{() => (
+        map(self.c.books, (book, i) => (
+            book.ready && (
+              <div onClick={() => self.c.setCurrentBookIndex(i)}>
+                Book: {book.title}
+              </div>
+            )
+          )) || null
+        )}
+      </Observer>
+      <Observer>{() => {
+        if (!self.c.currentBook || !self.c.currentBook.ready) {
+          return null;
+        }
         return (
-          book.ready && (
-            <div onClick={() => this.c.setCurrentBookIndex(i)}>
-              {book.title}
-            </div>
-          )
-        )}
-      )}
-
-        {this.c.currentBook && this.c.currentBook.ready && (
-          map(this.c.currentBook.chapters, (chapter, i) => (
-            <div key={chapter.title} onClick={() => this.c.playChapter(chapter, i)}>{this.c.currentBook.currentChapter === chapter ? '->' : '' } {chapter.title}</div>
+          map(self.c.currentBook.chapters, (chapter, i) => (
+            <div key={chapter.title} onClick={() => self.c.playChapter(chapter)}>{self.c.currentBook.currentChapter === chapter ? '->' : '' } {chapter.title}</div>
           ))
-        )}
+        )
+      }}
+      </Observer>
 
         <audio
           controls
-          ref={(e) => this.c.setAudioElement(e)}
+          ref={(e) => self.c.setAudioElement(e)}
         >
           <track />
         </audio>
-        <div>
-          {this.c.playbackRate}
-        </div>
-        <button onClick={() => this.c.setPlaybackRate(2)}>2</button>
-        <button onClick={() => this.c.setPlaybackRate(1.5)}>1.5</button>
-        <button onClick={() => this.c.setPlaybackRate(1)}>1</button>
 
-        <button onClick={() => this.c.adjustPlaybackRate(.1)}>+.1</button>
-        <button onClick={() => this.c.adjustPlaybackRate(.01)}>+.01</button>
-        <button onClick={() => this.c.adjustPlaybackRate(-.1)}>-.1</button>
-        <button onClick={() => this.c.adjustPlaybackRate(-.01)}>-.01</button>
+        <Observer>{() => (
+          <div>
+          Playback rate: {self.c.playbackRate}
+          </div> 
+        )}
+        </Observer>
+
+        <button onClick={() => self.c.setPlaybackRate(2)}>2</button>
+        <button onClick={() => self.c.setPlaybackRate(1.5)}>1.5</button>
+        <button onClick={() => self.c.setPlaybackRate(1)}>1</button>
+
+        <button onClick={() => self.c.adjustPlaybackRate(.1)}>+.1</button>
+        <button onClick={() => self.c.adjustPlaybackRate(.01)}>+.01</button>
+        <button onClick={() => self.c.adjustPlaybackRate(-.1)}>-.1</button>
+        <button onClick={() => self.c.adjustPlaybackRate(-.01)}>-.01</button>
       </div>
     );
   }
-}
+}))
 
-export default App;
+export default AppView;

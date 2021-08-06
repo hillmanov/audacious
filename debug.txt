@@ -1,0 +1,15 @@
+
+> audacious@0.1.0 start /home/scott/projects/projects/audacious
+> react-scripts start
+
+[34mℹ[39m [90m｢wds｣[39m: Project is running at http://192.168.86.47/
+[34mℹ[39m [90m｢wds｣[39m: webpack output is served from 
+[34mℹ[39m [90m｢wds｣[39m: Content not from webpack is served from /home/scott/projects/projects/audacious/public
+[34mℹ[39m [90m｢wds｣[39m: 404s will fallback to /
+Starting the development server...
+
+Failed to compile.
+
+./node_modules/jsmediatags/build2/ReactNativeFileReader.js
+Module not found: Can't resolve 'react-native-fs' in '/home/scott/projects/projects/audacious/node_modules/jsmediatags/build2'
+Compiling...
